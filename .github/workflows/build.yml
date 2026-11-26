@@ -1,0 +1,186 @@
+name: build
+
+# Builds a universal, signed and notarized FullscreenReminder.app and publishes it:
+#   - push to main  -> the "latest" pre-release (its files replaced on every build)
+#   - push a v* tag -> a versioned release, e.g. tag v1.2.0 -> release "FullscreenReminder 1.2.0"
+#   - manual run on main -> same as a push to main (rebuilds and republishes "latest")
+#   - pull requests -> build only (files kept as a workflow artifact)
+#
+# Actions are pinned to commits (tag in a comment): this job holds the Apple signing keys.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "demo.png"]
+  pull_request:
+  workflow_dispatch:
+
+# major.minor of the builds from main (the patch is the run number). 1.1: above the
+# 1.0.x versions built locally before.
+env:
+  BASE_VERSION: "1.1"
+
+# One run at a time per ref, so the "latest" release never mixes two builds' files.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="$BASE_VERSION.$GITHUB_RUN_NUMBER"
+          fi
+          echo "Version $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # With the APPLE_* secrets: import the Developer ID certificate into a temporary keychain
+      # and write the App Store Connect API key for notarytool. Without them: signed ad-hoc.
+      - name: Apple signing
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CERTIFICATE" ]; then
+            echo "No Apple secrets: signed ad-hoc, not notarized"
+            echo "CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(uuidgen)"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 \
+            -k "$keychain" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$keychain"
+
+          # Secrets pasted with a trailing newline or spaces break notarytool's checks.
+          API_ISSUER="$(printf '%s' "$API_ISSUER" | tr -d '[:space:]')"
+          API_KEY="$(printf '%s' "$API_KEY" | tr -d '[:space:]')"
+          uuid='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+          if ! [[ "$API_ISSUER" =~ $uuid ]]; then
+            echo "::error::APPLE_API_ISSUER must be the Issuer ID (a UUID) from App Store Connect > Users and Access > Integrations; it is ${#API_ISSUER} characters long"
+            [[ "$API_KEY" =~ $uuid ]] && echo "::error::APPLE_API_KEY looks like a UUID: the key ID and issuer secrets may be swapped"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$API_PRIVATE_KEY" > "$key"
+          {
+            echo "CODESIGN_IDENTITY=$SIGNING_IDENTITY"
+            echo "NOTARIZE=1"
+            echo "NOTARY_KEY_PATH=$key"
+            echo "NOTARY_KEY_ID=$API_KEY"
+            echo "NOTARY_ISSUER=$API_ISSUER"
+          } >> "$GITHUB_ENV"
+
+      - name: Build, sign and package
+        env:
+          UNIVERSAL: "1"
+          CREATE_DMG: "1"
+          NEW_MARKETING_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" Resources/Info.plist
+          ./build.sh
+          lipo -info dist/FullscreenReminder.app/Contents/MacOS/FullscreenReminder
+          ls -la dist
+
+      # Sparkle update feed: sign the zip with the update key (its public half is SUPublicEDKey
+      # in Info.plist) and describe it in appcast.xml, published beside it on the latest release.
+      - name: Sparkle appcast
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "::warning::No SPARKLE_PRIVATE_KEY secret: no appcast, installed copies won't see this update"
+            exit 0
+          fi
+          zip="FullscreenReminder-$VERSION.zip"
+          key="$RUNNER_TEMP/sparkle.key"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$key"
+          sig=$(.build/artifacts/sparkle/Sparkle/bin/sign_update --ed-key-file "$key" "dist/$zip")
+          rm -f "$key"
+          notes=$(git log -1 --format=%B "$GITHUB_SHA" | grep -vi '^co-authored-by:' | sed 's/]]>/]]]]><![CDATA[>/g')
+          cat > dist/appcast.xml <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>FullscreenReminder</title>
+              <item>
+                <title>Version $VERSION</title>
+                <pubDate>$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')</pubDate>
+                <sparkle:version>$BUILD_NUMBER</sparkle:version>
+                <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+                <description><![CDATA[<pre>$notes</pre>]]></description>
+                <enclosure url="https://github.com/$GITHUB_REPOSITORY/releases/download/latest/$zip" type="application/octet-stream" $sig/>
+              </item>
+            </channel>
+          </rss>
+          XML
+          cat dist/appcast.xml
+          xmllint --noout dist/appcast.xml
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: FullscreenReminder-${{ steps.version.outputs.version }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+
+      - name: Publish to the latest release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          notes="Version $VERSION, built from ${GITHUB_SHA:0:7}. Unzip and move FullscreenReminder.app to /Applications, or open the DMG."
+          gh release view latest >/dev/null 2>&1 \
+            || gh release create latest --prerelease --target "$GITHUB_SHA" --title "Latest build" --notes "$notes"
+          for a in $(gh release view latest --json assets --jq '.assets[].name'); do
+            gh release delete-asset latest "$a" --yes
+          done
+          gh release upload latest dist/*.zip dist/*.dmg --clobber
+          # The feed last, once the zip it points to is there.
+          [ -f dist/appcast.xml ] && gh release upload latest dist/appcast.xml --clobber
+          # Move the tag to this commit and date the title.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          gh release edit latest --prerelease --title "Latest build ($VERSION, $(LC_ALL=C date -u '+%b %-d, %Y'))" --notes "$notes"
+
+      - name: Publish the tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "FullscreenReminder $VERSION" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.dmg --clobber
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
